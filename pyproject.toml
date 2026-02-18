@@ -6,12 +6,34 @@ build-backend = "setuptools.build_meta"
 name = "speedcam"
 version = "0.1.0"
 description = "Vehicle speed estimation, heatmaps, and traffic flow counting — bring your own detector"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+authors = [
+    { name = "mfranzon", email = "43796979+mfranzon@users.noreply.github.com" },
+]
+keywords = ["computer vision", "speed estimation", "object tracking", "traffic", "heatmap", "vehicle detection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "numpy",
     "opencv-python",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mfranzon/speedcam"
+Repository = "https://github.com/mfranzon/speedcam"
+Issues = "https://github.com/mfranzon/speedcam/issues"
 
 [project.optional-dependencies]
 cli = ["rfdetr", "scipy"]
