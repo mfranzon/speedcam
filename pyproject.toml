@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speedcam"
+version = "0.1.0"
+description = "Vehicle speed estimation, heatmaps, and traffic flow counting — bring your own detector"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "numpy",
+    "opencv-python",
+]
+
+[project.optional-dependencies]
+cli = ["rfdetr", "scipy"]
+rfdetr = ["rfdetr"]
+yolo = ["ultralytics"]
+dev = ["pytest"]
+
+[project.scripts]
+speedcam = "speedcam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
