@@ -1,101 +1,144 @@
 import numpy as np
-from typing import List
+import supervision as sv
+from typing import List, Optional
 
-from .models import Detection, Track
+from trackers import (  # noqa: F401 — imports register tracker subclasses
+    ByteTrackTracker as _ByteTrackTracker,
+    SORTTracker as _SORTTracker,
+)
+from trackers.core.base import BaseTracker
 
-
-def _iou(boxA, boxB) -> float:
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    inter_area = max(0, xB - xA) * max(0, yB - yA)
-    boxA_area = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxB_area = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    union = boxA_area + boxB_area - inter_area
-    if union == 0:
-        return 0.0
-    return inter_area / union
+from .models import Track
+from .motion import BackgroundMotionEstimator
+from .depth import DepthEstimator
 
 
-class SimpleTracker:
-    """IoU-based multi-object tracker using the Hungarian algorithm.
+class Tracker:
+    """Multi-object tracker with background-motion-compensated trajectories
+    and speed estimation.
 
-    Matches detections to existing tracks frame-by-frame via IoU cost.
-    Unmatched detections spawn new tracks; tracks missing for more than
-    ``max_age`` frames are pruned.
-
-    Parameters
-    ----------
-    iou_threshold:
-        Minimum IoU required to match a detection to an existing track.
-    max_age:
-        Number of frames a track survives without a matching detection.
-
-    Example
-    -------
-    >>> tracker = SimpleTracker()
-    >>> tracks = tracker.update(detections)          # List[Track]
-    >>> all_ever_seen = tracker.all_tracks           # includes lost tracks
+    Trail points are stored in world coordinates (frame-0 reference).
+    The accumulated camera displacement is tracked so that trail points
+    can be reprojected to the current frame for drawing.
+    
+    When depth_estimator is provided, 3D trajectories are computed for
+    accurate speed estimation.
     """
 
-    def __init__(self, iou_threshold: float = 0.3, max_age: int = 30):
-        self.iou_threshold = iou_threshold
-        self.max_age = max_age
-        self.tracks: List[Track] = []
+    def __init__(
+        self,
+        frame_rate: float = 30.0,
+        lost_track_buffer: int = 30,
+        tracker_id: str = "bytetrack",
+        depth_estimator: Optional[DepthEstimator] = None,
+    ):
+        tracker_info = BaseTracker._lookup_tracker(tracker_id)
+        tracker_cls = tracker_info.tracker_class
+        if tracker_id == "bytetrack":
+            self._tracker = tracker_cls(
+                frame_rate=frame_rate,
+                lost_track_buffer=lost_track_buffer,
+                minimum_consecutive_frames=1,
+            )
+        else:
+            self._tracker = tracker_cls()
+
+        self._motion = BackgroundMotionEstimator()
+        self._depth = depth_estimator
+        self._last_depth_map: Optional[np.ndarray] = None
+        self._last_tracked: sv.Detections = sv.Detections.empty()
+        self._tracks_by_id: dict[int, Track] = {}
         self.all_tracks: List[Track] = []
         self.next_id: int = 0
 
-    def update(self, detections: List[Detection]) -> List[Track]:
-        """Update tracker with new detections and return active tracks."""
-        from scipy.optimize import linear_sum_assignment
+    @property
+    def last_tracked(self) -> sv.Detections:
+        return self._last_tracked
 
-        for track in self.tracks:
-            track.age += 1
-            track.time_since_update += 1
+    @property
+    def last_depth_map(self) -> Optional[np.ndarray]:
+        return self._last_depth_map
 
-        if not self.tracks or not detections:
-            matched = []
-            unmatched_dets = list(range(len(detections)))
-            unmatched_trks = list(range(len(self.tracks)))
-        else:
-            cost = np.zeros((len(self.tracks), len(detections)))
-            for t_idx, track in enumerate(self.tracks):
-                for d_idx, det in enumerate(detections):
-                    cost[t_idx, d_idx] = 1.0 - _iou(track.bbox, det.bbox)
+    @property
+    def has_depth(self) -> bool:
+        return self._depth is not None
 
-            row_indices, col_indices = linear_sum_assignment(cost)
+    @property
+    def camera_offset(self) -> tuple[float, float]:
+        """Camera displacement ``(dx, dy)`` from frame 0."""
+        return self._motion.camera_offset
 
-            matched = []
-            unmatched_dets = list(range(len(detections)))
-            unmatched_trks = list(range(len(self.tracks)))
+    @property
+    def world_to_frame(self) -> np.ndarray:
+        """3×3 homogeneous matrix: world coords → current frame coords."""
+        return self._motion.world_to_frame
 
-            for r, c in zip(row_indices, col_indices):
-                if cost[r, c] > (1.0 - self.iou_threshold):
+    @property
+    def world_to_frame_2x3(self) -> np.ndarray:
+        """2×3 affine matrix for ``cv2.transform``."""
+        return self._motion.world_to_frame_2x3
+
+    @property
+    def bg_speed_px(self) -> float:
+        """Background displacement magnitude (px/frame) — real speed proxy."""
+        dx, dy = self._motion.last_displacement
+        return (dx ** 2 + dy ** 2) ** 0.5
+
+    def update(
+        self, sv_detections: sv.Detections, frame: np.ndarray
+    ) -> List[Track]:
+        # 1. Background motion
+        self._motion.update(frame, sv_detections)
+
+        # 2. Depth estimation (if available)
+        if self._depth is not None:
+            self._last_depth_map = self._depth.estimate(frame)
+
+        # 3. Tracker update
+        tracked = self._tracker.update(sv_detections)
+        self._last_tracked = tracked
+
+        for t in self._tracks_by_id.values():
+            t.time_since_update += 1
+
+        active: List[Track] = []
+        if len(tracked) > 0 and tracked.tracker_id is not None:
+            for i in range(len(tracked)):
+                tid = int(tracked.tracker_id[i])
+                if tid < 0:
                     continue
-                matched.append((r, c))
-                unmatched_dets.remove(c)
-                unmatched_trks.remove(r)
 
-        for t_idx, d_idx in matched:
-            track = self.tracks[t_idx]
-            track.bbox = detections[d_idx].bbox
-            track.class_id = detections[d_idx].class_id
-            track.hits += 1
-            track.time_since_update = 0
-            track.trajectory.append(track.center)
+                bbox = tracked.xyxy[i]
+                cid = int(tracked.class_id[i]) if tracked.class_id is not None else 0
 
-        for d_idx in unmatched_dets:
-            det = detections[d_idx]
-            new_track = Track(
-                track_id=self.next_id,
-                bbox=det.bbox,
-                class_id=det.class_id,
-            )
-            new_track.trajectory.append(new_track.center)
-            self.tracks.append(new_track)
-            self.all_tracks.append(new_track)
-            self.next_id += 1
+                if tid not in self._tracks_by_id:
+                    track = Track(track_id=tid, bbox=bbox, class_id=cid)
+                    self._tracks_by_id[tid] = track
+                    self.all_tracks.append(track)
+                    if tid >= self.next_id:
+                        self.next_id = tid + 1
+                else:
+                    track = self._tracks_by_id[tid]
+                    track.bbox = bbox
+                    track.class_id = cid
+                    track.hits += 1
 
-        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
-        return self.tracks
+                track.time_since_update = 0
+                track.age += 1
+
+                # Store in world coords using affine inverse transform
+                cx, cy = track.center
+                track.trajectory.append(self._motion.transform_point_to_world(cx, cy))
+
+                # Compute 3D position if depth available
+                if self._depth is not None and self._last_depth_map is not None:
+                    depth = self._depth.get_depth_at(cx, cy, self._last_depth_map)
+                    track.depths.append(depth)
+                    x3d, y3d, z3d = self._depth.pixel_to_3d(
+                        cx, cy, depth=depth, depth_map=self._last_depth_map
+                    )
+                    track.trajectory_3d.append((x3d, y3d, z3d))
+
+                active.append(track)
+
+        return active

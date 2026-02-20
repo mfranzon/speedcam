@@ -27,6 +27,8 @@ classifiers = [
 dependencies = [
     "numpy",
     "opencv-python",
+    "trackers",
+    "supervision",
 ]
 
 [project.urls]
@@ -35,9 +37,8 @@ Repository = "https://github.com/mfranzon/speedcam"
 Issues = "https://github.com/mfranzon/speedcam/issues"
 
 [project.optional-dependencies]
-cli = ["rfdetr", "scipy"]
-rfdetr = ["rfdetr"]
-yolo = ["ultralytics"]
+detection = ["inference-models"]
+depth = ["depth-anything-v2"]
 dev = ["pytest"]
 
 [project.scripts]

@@ -9,6 +9,7 @@ speedcam traffic.mp4 --heatmap --flow --export-json report.json
 ## Features
 
 - **Speed estimation** — per-vehicle km/h from pixel trajectories, auto-calibrated from known vehicle dimensions or manual scale
+- **3D speed estimation** — true 3D velocities using metric depth estimation (Depth Anything V2) for accurate speeds regardless of perspective
 - **Speed heatmap** — colour overlay showing where vehicles move fast or slow across the scene
 - **Traffic flow counting** — virtual counting line with directional (up/down) counts per class
 - **Multi-object tracking** — IoU-based Hungarian-algorithm tracker with trajectory trails
@@ -25,13 +26,13 @@ speedcam traffic.mp4 --heatmap --flow --export-json report.json
 pip install speedcam
 
 # With RF-DETR detector (recommended)
-pip install "speedcam[cli]"
+pip install "speedcam[detection]"
+
+# With 3D depth estimation
+pip install "speedcam[detection,depth]"
 
 # With YOLO detector
 pip install "speedcam[yolo]"
-
-# Both detectors
-pip install "speedcam[cli,yolo]"
 ```
 
 Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org/) on `PATH` for video output.
@@ -54,6 +55,9 @@ speedcam VIDEO [options]
 | `--conf` | `0.25` | Detection confidence threshold |
 | `--output` | `output.mp4` | Output video path |
 | `--scale` | `0.0` | Meters per pixel (`0` = auto-calibrate from vehicle sizes) |
+| `--depth` | off | Enable 3D depth estimation for accurate speed (requires `depth-anything-v2`) |
+| `--depth-model` | `small` | Depth model size: `small`, `base`, or `large` |
+| `--focal-length` | `500.0` | Camera focal length in pixels (for 3D projection) |
 | `--heatmap` | off | Enable speed heatmap overlay |
 | `--flow` | off | Enable traffic flow counting line |
 | `--flow-line-y` | `0.5` | Counting line vertical position as fraction of frame height (0–1) |
@@ -73,6 +77,9 @@ speedcam highway.mp4
 
 # With heatmap and flow counter, export analytics
 speedcam highway.mp4 --heatmap --flow --export-json stats.json
+
+# 3D depth estimation for accurate speeds (perspective-aware)
+speedcam highway.mp4 --depth --depth-model small
 
 # Use YOLO, set known scale, no preview
 speedcam parking.mp4 --backend yolo --model yolov8n.pt --scale 0.04 --no-display
@@ -94,7 +101,8 @@ All components are importable directly and can be composed freely around any det
 import cv2
 from speedcam import (
     SpeedEstimator,
-    SimpleTracker,
+    Tracker,
+    DepthEstimator,
     FlowCounter,
     SpeedHeatmap,
     Analytics,
@@ -108,9 +116,12 @@ fps = cap.get(cv2.CAP_PROP_FPS)
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-tracker = SimpleTracker(iou_threshold=0.3, max_age=30)
+# Optional: 3D depth estimation for accurate speeds
+depth_estimator = DepthEstimator(model_size="small", metric=True)
+
+tracker = Tracker(frame_rate=fps, depth_estimator=depth_estimator)
 speed_estimator = SpeedEstimator(meters_per_pixel=0.05)  # or 0.0 for auto
-analytics = Analytics(fps=fps, speed_estimator=speed_estimator)
+analytics = Analytics(fps=fps, speed_estimator=speed_estimator, use_3d=True)
 heatmap = SpeedHeatmap(width, height)
 flow_counter = FlowCounter(height, line_y_ratio=0.5)
 writer = VideoWriter("output.mp4", fps, width, height)
@@ -120,10 +131,11 @@ while True:
     if not ret:
         break
 
-    # Plug in your own detector here — produce List[Detection]
-    detections: list[Detection] = my_detector(frame)
+    # Plug in your own detector here — produce sv.Detections
+    from supervision import Detections
+    detections: Detections = my_detector(frame)
 
-    tracks = tracker.update(detections)
+    tracks = tracker.update(detections, frame)
     analytics.update(tracks)
 
     annotated = draw_tracks(
@@ -131,6 +143,7 @@ while True:
         speed_estimator=speed_estimator,
         heatmap=heatmap,
         flow_counter=flow_counter,
+        use_3d=True,
     )
     writer.write(annotated)
 
@@ -171,7 +184,7 @@ det = Detection(
 
 When `--scale 0` (default), `SpeedEstimator` estimates `meters_per_pixel` automatically by observing the pixel width of detected vehicles and comparing to known average lengths (car ≈ 4.5 m, motorcycle ≈ 2.2 m, bus ≈ 12 m, truck ≈ 8 m). The estimate is averaged across all detections seen so far.
 
-For accurate results on perspective or wide-angle cameras, measure a known distance in the scene and pass `--scale <value>` explicitly.
+For accurate results on perspective or wide-angle cameras, use `--depth` for 3D speed estimation, or measure a known distance in the scene and pass `--scale <value>` explicitly.
 
 ---
 
@@ -185,6 +198,8 @@ For accurate results on perspective or wide-angle cameras, measure a known dista
   "per_class_count": { "car": 38, "truck": 6, "motorcycle": 3 },
   "avg_dwell_time_sec": 4.71,
   "avg_speed_kmh": 52.3,
+  "mode": "3d",
+  "avg_depth_m": 15.4,
   "meters_per_pixel": 0.0431
 }
 ```
