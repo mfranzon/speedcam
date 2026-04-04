@@ -26,7 +26,8 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
                 camera_offset: tuple[float, float] = (0.0, 0.0),
                 world_to_frame_2x3: np.ndarray | None = None,
                 bg_speed_px: float = 0.0,
-                use_3d: bool = False) -> np.ndarray:
+                use_3d: bool = False,
+                all_tracks: List[Track] | None = None) -> np.ndarray:
     if speed_estimator is None:
         speed_estimator = SpeedEstimator()
 
@@ -96,7 +97,22 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
 
     if not clean:
         active = sum(1 for t in tracks if t.time_since_update == 0)
-        panel_h = 100
+
+        # Compute avg speed across all tracks that have trajectories
+        source_tracks = all_tracks if all_tracks is not None else tracks
+        speeds = []
+        for t in source_tracks:
+            if use_3d and len(t.trajectory_3d) >= 2:
+                s = SpeedEstimator.speed_from_trajectory_3d(t.trajectory_3d, fps)
+            elif len(t.trajectory) >= 2:
+                s = speed_estimator.speed_from_trajectory(t.trajectory, fps)
+            else:
+                continue
+            if s > 0:
+                speeds.append(s)
+        avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
+
+        panel_h = 124
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (260, panel_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
@@ -107,12 +123,14 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
         mode_str = " (3D)" if use_3d else ""
         cv2.putText(frame, f"Total tracked: {total_unique}{mode_str}", (10, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(frame, f"Avg speed: {avg_speed:.1f} km/h", (10, 94),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 100), 1)
         class_counts: dict[int, int] = {}
         for t in tracks:
             if t.time_since_update == 0:
                 class_counts[t.class_id] = class_counts.get(t.class_id, 0) + 1
         class_str = " | ".join(f"{ALL_CLASSES.get(c, '?')}:{n}" for c, n in sorted(class_counts.items()))
-        cv2.putText(frame, class_str, (10, 92),
+        cv2.putText(frame, class_str, (10, 116),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
     return frame
