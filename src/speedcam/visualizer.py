@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from typing import List
-from .models import Track, ALL_CLASSES
+from .models import Track, ALL_CLASSES, DIRECTION_COLORS
 from .estimator import SpeedEstimator
 from .heatmap import SpeedHeatmap
 from .flow import FlowCounter
@@ -27,7 +27,8 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
                 world_to_frame_2x3: np.ndarray | None = None,
                 bg_speed_px: float = 0.0,
                 use_3d: bool = False,
-                all_tracks: List[Track] | None = None) -> np.ndarray:
+                all_tracks: List[Track] | None = None,
+                color_by_direction: bool = False) -> np.ndarray:
     if speed_estimator is None:
         speed_estimator = SpeedEstimator()
 
@@ -35,7 +36,10 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
         if track.time_since_update > 0:
             continue
         x1, y1, x2, y2 = track.bbox.astype(int)
-        color = CLASS_COLORS.get(track.class_id, (255, 255, 255))
+        if color_by_direction:
+            color = track.direction_color
+        else:
+            color = CLASS_COLORS.get(track.class_id, (255, 255, 255))
         label = ALL_CLASSES.get(track.class_id, "?")
 
         if not no_trails and len(track.trajectory) >= 2:
@@ -60,7 +64,8 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             dwell = track.hits / fps
             depth_str = f" d:{track.last_depth:.1f}m" if use_3d and track.depths else ""
-            text = f"ID:{track.track_id} {label} {dwell:.1f}s{depth_str}"
+            dir_str = f" [{track.direction}]" if color_by_direction else ""
+            text = f"ID:{track.track_id} {label} {dwell:.1f}s{depth_str}{dir_str}"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw, y1), color, -1)
             cv2.putText(frame, text, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
@@ -132,5 +137,46 @@ def draw_tracks(frame: np.ndarray, tracks: List[Track], frame_idx: int,
         class_str = " | ".join(f"{ALL_CLASSES.get(c, '?')}:{n}" for c, n in sorted(class_counts.items()))
         cv2.putText(frame, class_str, (10, 116),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+        if color_by_direction:
+            # Total unique vehicles per direction (cumulative)
+            total_dir: dict[str, int] = {}
+            count_source = all_tracks if all_tracks is not None else tracks
+            for t in count_source:
+                d = t.direction
+                if d != "unknown":
+                    total_dir[d] = total_dir.get(d, 0) + 1
+
+            # Active (current frame) per direction
+            active_dir: dict[str, int] = {}
+            for t in tracks:
+                if t.time_since_update == 0 and t.direction != "unknown":
+                    active_dir[t.direction] = active_dir.get(t.direction, 0) + 1
+
+            all_dirs = sorted(set(list(total_dir.keys()) + list(active_dir.keys())))
+            if all_dirs:
+                legend_x = frame.shape[1] - 280
+                legend_y = 10
+                header_h = 28
+                row_h = 26
+                legend_h = header_h + row_h * len(all_dirs) + 10
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (legend_x - 10, legend_y),
+                              (legend_x + 270, legend_y + legend_h), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+                cv2.putText(frame, "Direction      Active  Total",
+                            (legend_x + 5, legend_y + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+                for i, d in enumerate(all_dirs):
+                    y = legend_y + header_h + 22 + i * row_h
+                    c = DIRECTION_COLORS.get(d, (128, 128, 128))
+                    cv2.circle(frame, (legend_x + 10, y - 5), 6, c, -1)
+                    act = active_dir.get(d, 0)
+                    tot = total_dir.get(d, 0)
+                    cv2.putText(frame, f"{d:<12s}   {act:>3d}    {tot:>3d}",
+                                (legend_x + 24, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
 
     return frame

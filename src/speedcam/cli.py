@@ -17,6 +17,7 @@ from .tracker import Tracker
 from .visualizer import draw_tracks
 from .video import VideoWriter
 from .depth import DepthEstimator
+from .exit_counter import ExitCounter, ExitLine
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +25,34 @@ from .depth import DepthEstimator
 # ---------------------------------------------------------------------------
 
 def _load_model(model_id: str):
-    """Load a detection model via ``inference_models.AutoModel``."""
+    """Load a detection model.
+
+    Supports:
+    - YOLO .pt files (via ultralytics)
+    - rfdetr-base / rfdetr-large (via rfdetr)
+    - Anything else via inference_models.AutoModel
+    """
+    # YOLO .pt file
+    if model_id.endswith(".pt"):
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            print("Error: ultralytics is required for YOLO models.", file=sys.stderr)
+            raise SystemExit(1) from exc
+        return YOLO(model_id)
+
+    # rfdetr models
+    if model_id.startswith("rfdetr"):
+        try:
+            import rfdetr
+        except ImportError as exc:
+            print("Error: rfdetr is required for RF-DETR models.", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if "large" in model_id:
+            return rfdetr.RFDETRLarge()
+        return rfdetr.RFDETRBase()
+
+    # Fallback to inference_models
     try:
         from inference_models import AutoModel
     except ImportError as exc:
@@ -40,6 +68,24 @@ def _load_model(model_id: str):
 
 def _run_model(model, frame: np.ndarray, confidence: float) -> sv.Detections:
     """Run model inference and return ``sv.Detections``."""
+    # rfdetr returns sv.Detections directly from predict()
+    if hasattr(model, 'predict') and hasattr(model, 'model_config'):
+        detections = model.predict(frame, threshold=confidence)
+        if not isinstance(detections, sv.Detections):
+            return sv.Detections.empty()
+        # Clear non-per-detection data that breaks boolean indexing
+        detections.data = {}
+        return detections
+
+    # YOLO models
+    if hasattr(model, 'names') and callable(model):
+        results = model(frame, conf=confidence, verbose=False)
+        if not results:
+            return sv.Detections.empty()
+        detections = sv.Detections.from_ultralytics(results[0])
+        return detections
+
+    # inference_models API
     predictions = model(frame)
     if not predictions:
         return sv.Detections.empty()
@@ -180,11 +226,22 @@ def main():
                         help="Depth model size (default: small)")
     parser.add_argument("--focal-length", type=float, default=500.0,
                         help="Camera focal length in pixels for 3D projection (default: 500)")
+    parser.add_argument("--direction", action="store_true",
+                        help="Color-code detections by direction of travel")
+    parser.add_argument("--exits", default=None,
+                        help="Exit counting lines config: 'roundabout' preset or JSON file")
     args = parser.parse_args()
 
     # ---- Load model ----
     model = _load_model(args.model)
-    class_names: list[str] = getattr(model, "class_names", [])
+    # YOLO uses .names (dict), rfdetr/inference_models use .class_names (list)
+    if hasattr(model, "class_names"):
+        class_names: list[str] = model.class_names
+    elif hasattr(model, "names"):
+        names = model.names
+        class_names = [names[i] for i in sorted(names.keys())] if isinstance(names, dict) else list(names)
+    else:
+        class_names = []
     class_filter = resolve_class_filter(args.classes, class_names)
 
     # ---- Source ----
@@ -224,6 +281,25 @@ def main():
     analytics = Analytics(fps=fps, speed_estimator=speed_estimator, use_3d=args.depth)
     heatmap = SpeedHeatmap(width, height) if args.heatmap else None
     flow_counter = FlowCounter(height, line_y_ratio=args.flow_line_y) if args.flow else None
+
+    # ---- Exit counter ----
+    exit_counter = None
+    if args.exits == "roundabout":
+        exit_counter = ExitCounter([
+            ExitLine("NW", (700, 500), (1300, 50), (0, 255, 0)),
+            ExitLine("NE", (2850, 80), (3500, 620), (0, 0, 255)),
+            ExitLine("SW", (330, 1540), (1000, 2080), (255, 0, 0)),
+            ExitLine("SE", (2850, 2080), (3500, 1540), (255, 255, 0)),
+        ])
+    elif args.exits:
+        import json
+        with open(args.exits) as f:
+            cfg = json.load(f)
+        exit_counter = ExitCounter([
+            ExitLine(e["name"], tuple(e["p1"]), tuple(e["p2"]), tuple(e["color"]))
+            for e in cfg["exits"]
+        ])
+
     writer = VideoWriter(args.output, fps, width, height)
 
     print(f"Processing: {args.source} ({width}x{height} @ {fps:.1f} FPS"
@@ -266,7 +342,14 @@ def main():
                 world_to_frame_2x3=tracker.world_to_frame_2x3,
                 bg_speed_px=tracker.bg_speed_px,
                 use_3d=args.depth,
+                color_by_direction=args.direction,
+                all_tracks=tracker.all_tracks,
             )
+
+            if exit_counter is not None:
+                exit_counter.update(tracks)
+                annotated = exit_counter.render(annotated)
+
             writer.write(annotated)
 
             if not args.no_display:
@@ -287,6 +370,13 @@ def main():
             pass
 
     analytics.print_summary(tracker.all_tracks)
+
+    if exit_counter is not None:
+        print("\n=== Exit Counts ===")
+        for ex in exit_counter.exits:
+            total = ex.count_in + ex.count_out
+            print(f"  {ex.name:<6s}  In: {ex.count_in:>3d}  Out: {ex.count_out:>3d}  Total: {total:>3d}")
+        print("===================\n")
 
     if args.export_json:
         analytics.export_json(tracker.all_tracks, args.export_json)
